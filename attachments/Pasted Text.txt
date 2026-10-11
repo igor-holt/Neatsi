@@ -1,0 +1,586 @@
+## Selection
+
+**Choose Delineation 3: Control-plane inversion synthesis.**
+
+The winning integration is **not** “make the GTX 1650 do more inference.” It is:
+
+> Use the GTX 1650 / CUDA-Q lane as a **TTECTrA-style transient controller** for routing, memory paging, sparse feature recall, and fallback gating, while heavy inference remains cloud / larger-endpoint / queued depending on route cost.
+
+That matches the prior `/RQA_PASSED` correction: CUDA-Q / ROCm is used for **dispatch optimization**, not Hermes forward-pass inference. It also matches the uploaded AAL handoff: diamondnode runs the local SAE dictionary, feature store, and Yennefer thermodynamic pager; AAL exposes `memory_recall`, `memory_store`, `kvdf_attest`, `kvdf_query`, and `memory_thermo_report`; KVDF-attested memory calls escalate to `prod_sensitive`; and raw embeddings are not stored in AAL D1. 
+
+NASA’s TTECTrA is useful here only as a control-design pattern: it builds a basic controller with transient protection from a user model and constraints, rather than replacing the engine itself. ([software.nasa.gov][1]) The same pattern should govern diamondnode: model the runtime substrate, apply limiters, then choose the safest high-throughput route.
+
+---
+
+# 1. Three delineations
+
+## Delineation A — **Local-inference maximization**
+
+**Thesis:** Push Hermes 8B-Q3 through `llama.cpp` with partial GPU offload, GGUF streaming, mmap, and KV-cache quantization.
+
+**Use when:**
+
+* privacy requires local execution;
+* cloud route is unavailable;
+* prompt is short;
+* latency tolerance is moderate;
+* OOM risk is below gate.
+
+**Relevant benchmark reality:** `llama.cpp` supports CUDA builds through `GGML_CUDA=ON`, and the project includes tools ranging from minimal examples to an OpenAI-compatible HTTP server. ([GitHub][2]) But the GTX 1650 class is a 4 GB VRAM, 128-bit memory-bus device, so it is primarily a fallback substrate, not a primary inference accelerator. ([Wikipedia][3]) Current consumer-inference benchmarking also reinforces the “VRAM wall”: PCIe-bottlenecked CPU offload can reduce throughput by more than 90% compared with full-GPU execution for large models. ([arXiv][4])
+
+**Expected implementation gate, not a claimed benchmark:**
+
+| Metric                  |                                  Gate |
+| ----------------------- | ------------------------------------: |
+| Model                   |          Hermes-compatible 8B Q3 GGUF |
+| Runtime                 | `llama.cpp` under Podman via `aSHARD` |
+| GPU                     |                         GTX 1650 4 GB |
+| `tokens/sec`            |     `>= 4` accepted; `< 4` route away |
+| p95 first-token latency |                            `<= 4.5 s` |
+| p95 completion latency  |   `<= 30 s` for fallback prompt class |
+| OOM rate                |     `<= 0.5%` over 200 fallback calls |
+| Peak VRAM               |                          `<= 3900 MB` |
+
+**Verdict:** useful, but not the winning throughput path. It maximizes local autonomy, not global throughput.
+
+---
+
+## Delineation B — **Memory-fabric inversion**
+
+**Thesis:** Do not push full dense inference onto the GTX 1650. Use it for sparse feature projection, SAE recall, Yennefer VRAM↔SSD paging, and hot-memory selection.
+
+**Use when:**
+
+* request is recall-heavy;
+* same concepts recur across agents;
+* KVDF proof is required after recall;
+* the expensive operation is memory traversal, not token generation.
+
+This aligns directly with the uploaded handoff: the SAE Thermodynamic Memory Fabric is exposed through AAL for high-fidelity, interpretable memory recall and KVDF attestation, with diamondnode as the local source of truth for SAE dictionary, feature store, and thermodynamic pager. 
+
+**Core inversion opportunity:**
+
+| Normal assumption              | Inverted design                                         |
+| ------------------------------ | ------------------------------------------------------- |
+| Keep model hot in VRAM         | Keep sparse feature indices / hot dictionary slices hot |
+| Run all inference locally      | Recall locally, infer remotely if needed                |
+| Store embeddings in gateway DB | Persist only sparse feature refs + KVDF receipts        |
+| Synchronous proofs             | Synchronous recall, queued attestation                  |
+
+**Expected implementation gate:**
+
+| Metric                                     |                                                                         Gate |
+| ------------------------------------------ | ---------------------------------------------------------------------------: |
+| `memory_recall` hot path                   |                                                                  synchronous |
+| `memory_recall + require_kvdf_attestation` |              recall synchronous, proof queued unless caller demands blocking |
+| Raw embedding persistence in AAL D1        |                                                                    forbidden |
+| D1 persistence                             |                                         feature refs + KVDF receipt IDs only |
+| `memory_thermo_report`                     |                                      returns latest Yennefer paging decision |
+| Policy tier                                | `prod_sensitive` when KVDF attestation or long-term KVDF feature is involved |
+
+**Verdict:** best single inversion for memory throughput and canon safety. It turns the 4 GB GPU from a weak LLM host into a useful hot-feature accelerator.
+
+---
+
+## Delineation C — **Control-plane inversion synthesis**
+
+**Thesis:** Put the Dispatch Router above Hermes, SAE, Yennefer, KVDF, cloud endpoints, and local fallback. Treat `/RQA_PASSED` as a QUBO-style route-selection pass.
+
+This is the selected architecture.
+
+QUBO is a natural fit because binary variables can encode route choices, context inclusion, endpoint selection, layer placement, queue/defer decisions, and proof requirements. QUBO formulations are widely used to express combinatorial optimization problems including knapsack-style problems, graph coloring, and production-scale mappings to quantum annealing / Ising solvers. ([arXiv][5])
+
+Canonical objective:
+
+```text
+minimize:
+  route_cost =
+      latency_penalty
+    + OOM_penalty
+    + VRAM_penalty
+    + cloud_cost_penalty
+    + privacy_penalty
+    + stale_memory_penalty
+    + KVDF_blocking_penalty
+    - hot_feature_bonus
+    - cache_hit_bonus
+```
+
+Subject to:
+
+```text
+one route family per task
+VRAM_peak <= 3900 MB for GTX 1650 lane
+OOM_rate <= 0.5%
+prod_sensitive rules enforced
+raw embeddings never stored in AAL D1
+KVDF proof generated only after successful recall/reconstruction
+```
+
+**Verdict:** highest total throughput because it avoids the bad local-inference path before the system wastes time there.
+
+---
+
+# 2. Arbitration matrix
+
+| Criterion                 | A — Local inference |     B — Memory fabric | C — Control-plane synthesis |
+| ------------------------- | ------------------: | --------------------: | --------------------------: |
+| Hardware throughput       |          Medium-low |       High for recall |         Highest system-wide |
+| GTX 1650 fit              |  Risky but possible |                  Good |                        Good |
+| OOM risk                  |                High |            Low-medium |                      Lowest |
+| Latency control           |            Unstable | Stable for hot recall |                        Best |
+| KVDF integration          |              Add-on |                Native |                      Native |
+| Canon safety              |              Medium |                  High |                     Highest |
+| Implementation complexity |              Medium |           Medium-high |                        High |
+| Benchmark alignment       |  Weak for 4 GB VRAM |              Stronger |                   Strongest |
+| Selected?                 |                  No |               Partial |                     **Yes** |
+
+**Selection rationale:**
+FlexGen and ZeRO-Infinity prove that heterogeneous offload can break memory ceilings, but they are primarily capacity-enabling patterns. FlexGen reaches large-model execution on limited GPU memory by aggregating GPU, CPU, and disk, but its headline OPT-175B-on-16GB result is about making execution possible, not low-latency interactive serving. ([arXiv][6]) ZeRO-Infinity similarly targets extreme-scale training through GPU/CPU/NVMe memory, not a 4 GB interactive local-inference path. ([arXiv][7]) For serving throughput, modern systems win through memory management, batching, and KV-cache handling; vLLM/PagedAttention-style serving reports 2–4× throughput improvements over older baselines, and later comparative work reports vLLM outperforming TGI under high-concurrency workloads while TGI can have better tail latency for interactive use. ([Wikipedia][8])
+
+So the synthesis should route high-throughput inference to serving backends and use diamondnode for **routing, fallback, sparse recall, paging, and evidence**.
+
+---
+
+# 3. Integrated architecture
+
+```mermaid
+flowchart TD
+    AAL["Ambient Access Layer<br>Cloudflare Workers + D1 + Queues"] --> DR["Genesis Conductor Dispatch Router<br>/RQA_PASSED QUBO route solver"]
+
+    DR --> HOT["Hot memory path<br>diamondnode SAE + Yennefer pager"]
+    DR --> LOCAL["Local fallback path<br>Podman + aSHARD + llama.cpp + Hermes 8B-Q3"]
+    DR --> CLOUD["Cloud / high-throughput inference endpoint<br>vLLM/TGI/provider route"]
+    DR --> QUEUE["Queue path<br>KVDF attestation + heavy thermo reports"]
+
+    HOT --> SAE["sae_memory.recall/store"]
+    QUEUE --> KVDF["kvdf.attest_feature/query_features"]
+    QUEUE --> THERMO["yennefer.memory_traversal_report"]
+
+    SAE --> RESP["Reconstruction + sparse refs"]
+    KVDF --> RECEIPT["KVDF receipt / Diamond-Vault proof"]
+    LOCAL --> RESP
+    CLOUD --> RESP
+```
+
+---
+
+# 4. Concrete route policy
+
+## New AAL route table
+
+```python
+ROUTING_TABLE = {
+    "memory_recall": "sae_memory.recall",
+    "memory_store": "sae_memory.store",
+    "kvdf_attest": "kvdf.attest_feature",
+    "kvdf_query": "kvdf.query_features",
+    "memory_thermo_report": "yennefer.memory_traversal_report",
+}
+```
+
+## Dispatch classes
+
+| Class                     | Route                              |                               Sync? | Hardware target             |
+| ------------------------- | ---------------------------------- | ----------------------------------: | --------------------------- |
+| Hot sparse recall         | `memory_recall`                    |                                 Yes | diamondnode SAE/Yennefer    |
+| Recall + proof            | `memory_recall` then `kvdf_attest` | Recall yes, proof queued by default | diamondnode + Diamond-Vault |
+| Heavy thermo report       | `memory_thermo_report`             |                      Usually queued | Yennefer                    |
+| Local fallback inference  | `hermes-local-fallback-8b-q3`      |                   Yes if gates pass | GTX 1650 + CPU              |
+| High-throughput inference | cloud/vLLM/TGI route               |                                 Yes | remote endpoint             |
+| Unsafe / too costly       | reject/defer/compress              |                                 N/A | router decision             |
+
+---
+
+# 5. QUBO-style route variables
+
+Define binary variables:
+
+```text
+x_local      = use local Hermes fallback
+x_cloud      = use cloud inference
+x_recall     = use SAE memory recall
+x_kvdf_async = queue KVDF attestation
+x_kvdf_sync  = block on KVDF attestation
+x_compress   = compress context before routing
+x_defer      = defer request
+x_reject     = reject request
+```
+
+One-hot family constraint:
+
+```text
+x_local + x_cloud + x_defer + x_reject = 1
+```
+
+Memory augmentation can compose:
+
+```text
+x_recall ∈ {0,1}
+x_kvdf_async + x_kvdf_sync <= x_recall
+```
+
+Route score:
+
+```python
+def route_score(route, m):
+    return (
+        0.28 * m.p95_latency_ms_norm
+        + 0.22 * m.oom_risk_norm
+        + 0.14 * m.vram_pressure_norm
+        + 0.12 * m.cloud_cost_norm
+        + 0.10 * m.policy_risk_norm
+        + 0.08 * m.kvdf_blocking_cost_norm
+        + 0.06 * m.eta_thermo_norm
+        - 0.10 * m.hot_feature_hit_norm
+        - 0.06 * m.cache_hit_norm
+    )
+```
+
+Hard guards override score:
+
+```python
+def hard_reject(route, m):
+    if route == "local_hermes" and m.peak_vram_mb > 3900:
+        return True
+    if route == "local_hermes" and m.oom_rate > 0.005:
+        return True
+    if route == "local_hermes" and m.tokens_per_sec < 4.0:
+        return True
+    if m.requires_kvdf and m.policy_tier != "prod_sensitive":
+        return True
+    if m.raw_embedding_would_enter_d1:
+        return True
+    return False
+```
+
+---
+
+# 6. Throughput synthesis
+
+## Implement this as the default routing ladder
+
+```text
+1. Classify request:
+   memory / inference / proof / mixed / report
+
+2. If memory-heavy:
+   call diamondnode SAE recall first
+
+3. If attestation required:
+   return recall result immediately when allowed
+   queue KVDF attestation unless caller explicitly requires blocking
+
+4. If inference required:
+   prefer cloud/high-throughput endpoint unless:
+     - privacy requires local
+     - local gate is green
+     - prompt is short
+     - route score prefers local
+
+5. If local:
+   run Hermes 8B-Q3 through aSHARD + llama.cpp partial offload
+
+6. If local gate fails:
+   compress context or route cloud/defer
+
+7. Always emit route witness:
+   selected route
+   rejected alternatives
+   metric window
+   eta_thermo
+   KVDF receipt if present
+```
+
+---
+
+# 7. Expected vs benchmark-informed performance
+
+These are **deployment targets**, not measured results until diamondnode benchmarking is run.
+
+| Path                        | Benchmark-informed expectation                        | Gate                                                 |
+| --------------------------- | ----------------------------------------------------- | ---------------------------------------------------- |
+| Full local dense inference  | Poor fit for 4 GB VRAM; PCIe offload likely dominates | fallback only                                        |
+| Local 8B-Q3 partial offload | Viable degraded mode                                  | `>= 4 tok/s`, p95 TTFT `<= 4.5 s`                    |
+| SAE hot recall              | Strong fit if feature index stays hot                 | p95 local MCP recall target `< 250 ms`               |
+| Recall + async KVDF         | Strong fit                                            | API returns recall first; proof receipt later        |
+| Cloud/vLLM/TGI inference    | Highest serving throughput                            | selected when cost/privacy gates allow               |
+| Heavy thermo report         | Queue                                                 | no blocking interactive path                         |
+| QUBO route solve            | Small combinatorial problem; good fit                 | route decision target `< 50 ms` for normal envelopes |
+
+---
+
+# 8. `aSHARD` runtime profile
+
+```yaml
+ashard:
+  role: local_runtime_wrapper
+  public_product: false
+  manages:
+    - podman
+    - llama.cpp
+    - gguf_mmap
+    - partial_gpu_offload
+    - yennefer_pager
+    - sae_feature_store
+    - route_telemetry
+  gpu:
+    device: GTX_1650
+    max_vram_mb: 3900
+    role:
+      - signer
+      - router
+      - sparse_feature_accelerator
+      - q3_8b_fallback
+  forbidden_claims:
+    - cuda_q_runs_transformer_inference
+    - reverse_quantum_annealing_generates_tokens
+    - gtx_1650_is_primary_unbounded_inference_gpu
+```
+
+---
+
+# 9. Minimal implementation patch
+
+## `dispatch_router.py`
+
+```python
+from dataclasses import dataclass
+from enum import Enum
+
+
+class Route(str, Enum):
+    SAE_RECALL = "sae_recall"
+    LOCAL_HERMES = "local_hermes"
+    CLOUD_INFERENCE = "cloud_inference"
+    KVDF_ASYNC = "kvdf_async"
+    KVDF_SYNC = "kvdf_sync"
+    THERMO_QUEUE = "thermo_queue"
+    DEFER = "defer"
+    REJECT = "reject"
+
+
+@dataclass(frozen=True)
+class Metrics:
+    p95_latency_ms_norm: float
+    oom_risk_norm: float
+    vram_pressure_norm: float
+    cloud_cost_norm: float
+    policy_risk_norm: float
+    kvdf_blocking_cost_norm: float
+    eta_thermo_norm: float
+    hot_feature_hit_norm: float
+    cache_hit_norm: float
+
+    peak_vram_mb: int
+    oom_rate: float
+    tokens_per_sec: float
+    requires_kvdf: bool
+    policy_tier: str
+    raw_embedding_would_enter_d1: bool
+
+
+def hard_reject(route: Route, m: Metrics) -> bool:
+    if route == Route.LOCAL_HERMES:
+        if m.peak_vram_mb > 3900:
+            return True
+        if m.oom_rate > 0.005:
+            return True
+        if m.tokens_per_sec < 4.0:
+            return True
+
+    if m.requires_kvdf and m.policy_tier != "prod_sensitive":
+        return True
+
+    if m.raw_embedding_would_enter_d1:
+        return True
+
+    return False
+
+
+def route_score(m: Metrics) -> float:
+    return (
+        0.28 * m.p95_latency_ms_norm
+        + 0.22 * m.oom_risk_norm
+        + 0.14 * m.vram_pressure_norm
+        + 0.12 * m.cloud_cost_norm
+        + 0.10 * m.policy_risk_norm
+        + 0.08 * m.kvdf_blocking_cost_norm
+        + 0.06 * m.eta_thermo_norm
+        - 0.10 * m.hot_feature_hit_norm
+        - 0.06 * m.cache_hit_norm
+    )
+
+
+def choose_route(candidates: dict[Route, Metrics]) -> Route:
+    valid = {
+        route: metrics
+        for route, metrics in candidates.items()
+        if not hard_reject(route, metrics)
+    }
+
+    if not valid:
+        return Route.DEFER
+
+    return min(valid, key=lambda r: route_score(valid[r]))
+```
+
+## AAL policy escalation
+
+```python
+def resolve_policy_tier(request_type: str, payload: dict, requested_tier: str | None) -> str:
+    requires_kvdf = bool(payload.get("require_kvdf_attestation"))
+
+    if request_type in {"kvdf_attest", "kvdf_query"}:
+        return "prod_sensitive"
+
+    if request_type in {"memory_recall", "memory_store"} and requires_kvdf:
+        return "prod_sensitive"
+
+    return requested_tier or "standard"
+```
+
+## Persistence rule
+
+```python
+def persist_memory_receipt(d1, event: dict) -> None:
+    if "query_embedding" in event:
+        raise ValueError("Raw embeddings must not be stored in AAL D1")
+
+    allowed = {
+        "event_id",
+        "workspace_id",
+        "feature_refs",
+        "kvdf_receipt_id",
+        "diamond_vault_uri",
+        "route_witness_id",
+        "created_at",
+    }
+
+    row = {k: v for k, v in event.items() if k in allowed}
+    d1.insert("memory_attestation_receipts", row)
+```
+
+---
+
+# 10. Deployment benchmark harness
+
+Run this before marking `hermes-local-fallback-8b-q3` operational:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL="${MODEL:-/models/hermes-3-8b-q3.gguf}"
+PROMPT_FILE="${PROMPT_FILE:-bench_prompts/fallback_short.txt}"
+OUT="${OUT:-bench_results/hermes_8b_q3_$(date +%Y%m%d_%H%M%S).jsonl}"
+
+mkdir -p "$(dirname "$OUT")"
+
+for NGL in 8 12 16 20 24 28 32; do
+  /usr/local/bin/ashard-run llama-bench \
+    --model "$MODEL" \
+    --prompt-file "$PROMPT_FILE" \
+    --n-gpu-layers "$NGL" \
+    --ctx-size 2048 \
+    --batch-size 128 \
+    --ubatch-size 64 \
+    --cache-type-k q4_0 \
+    --cache-type-v q4_0 \
+    --json \
+    | tee -a "$OUT"
+done
+```
+
+Promotion rule:
+
+```yaml
+promotion:
+  skill_id: hermes-local-fallback-8b-q3
+  required_samples: 200
+  gates:
+    tokens_per_sec_min: 4.0
+    p95_first_token_latency_ms_max: 4500
+    p95_total_latency_ms_max: 30000
+    oom_rate_max: 0.005
+    peak_vram_mb_max: 3900
+  on_fail:
+    - reduce_n_gpu_layers
+    - reduce_context
+    - compress_prompt
+    - route_cloud
+    - defer
+```
+
+---
+
+# 11. Final synthesis
+
+Integrate the proposal as:
+
+```yaml
+genesis_conductor_dispatch_synthesis:
+  selected_delineation: control_plane_inversion
+  ttectra_mapping:
+    plant_model: diamondnode_runtime_state
+    controller: genesis_conductor_dispatch_router
+    limiters:
+      - vram_peak
+      - oom_rate
+      - p95_latency
+      - cloud_cost
+      - policy_tier
+      - kvdf_blocking_cost
+    transient_response:
+      - time_to_first_token
+      - memory_recall_latency
+      - proof_receipt_latency
+      - route_abort_rate
+
+  aal_routes:
+    memory_recall: sae_memory.recall
+    memory_store: sae_memory.store
+    kvdf_attest: kvdf.attest_feature
+    kvdf_query: kvdf.query_features
+    memory_thermo_report: yennefer.memory_traversal_report
+
+  hardware_roles:
+    gtx_1650:
+      primary:
+        - dispatch_scoring
+        - sparse_feature_hot_path
+        - yennefer_paging_decision_support
+        - signer_router
+      fallback:
+        - hermes_8b_q3_llama_cpp
+      prohibited:
+        - primary_unbounded_inference
+        - cuda_q_transformer_forward_pass
+
+  throughput_strategy:
+    first: hot_sae_recall
+    second: route_cloud_for_dense_inference
+    third: local_hermes_only_when_gates_pass
+    fourth: queue_kvdf_and_heavy_reports
+
+  operational_result:
+    expected_best_path: memory_recall_local_plus_inference_remote_plus_async_kvdf
+    reason: avoids_4gb_vram_wall_while_preserving_local_evidence_and_memory_control
+```
+
+## Bottom line
+
+The maximum-throughput implementation is:
+
+> **AAL as secure gateway → Dispatch Router as TTECTrA-style controller → diamondnode for SAE/Yennefer hot memory + local fallback → cloud/high-throughput endpoint for dense inference → KVDF attestation queued unless explicitly blocking.**
+
+That gives the GTX 1650 its best role: **control, sparse recall, paging, signing, fallback**, not primary dense inference.
+
+[1]: https://software.nasa.gov/software/LEW-19177-1 "Tool for Turbine Engine Closed-loop Transient Analysis (TTECTrA)(LEW-19177-1) | NASA Software Catalog"
+[2]: https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md "llama.cpp/docs/build.md at master · ggml-org/llama.cpp · GitHub"
+[3]: https://en.wikipedia.org/wiki/GeForce_GTX_16_series?utm_source=chatgpt.com "GeForce GTX 16 series"
+[4]: https://arxiv.org/abs/2605.00519?utm_source=chatgpt.com "Silicon Showdown: Performance, Efficiency, and Ecosystem Barriers in Consumer-Grade LLM Inference"
+[5]: https://arxiv.org/abs/2103.01708?utm_source=chatgpt.com "PyQUBO: Python Library for Mapping Combinatorial Optimization Problems to QUBO Form"
+[6]: https://arxiv.org/abs/2303.06865?utm_source=chatgpt.com "FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU"
+[7]: https://arxiv.org/abs/2104.07857?utm_source=chatgpt.com "ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning"
+[8]: https://en.wikipedia.org/wiki/PagedAttention?utm_source=chatgpt.com "PagedAttention"
